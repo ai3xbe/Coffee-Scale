@@ -12,24 +12,25 @@
 #include <OneWire.h>
 #include <DallasTemperature.h>
 
+#define VERSION "V2.0"
 #define LARGE_TEXT 2
 #define SMALL_TEXT 1
 #define SCREEN_WIDTH 128 // OLED display width, in pixels
 #define SCREEN_HEIGHT 64 // OLED display height, in pixels
-#define VERSION "V2.0"
-#define TARE_TIMER_DURATION 30000 //the duration to start the timer for after a TARE
-#define POST_TARE_DELAY 1000 //amount of time to minus from the timer after a tare
-#define SCALE_ADDR 15
-#define SHOT_ADDR 0  //address to store shot counter
-#define CLEAN_ADDR 32
-#define refWeight 447.8
+#define TARE_TIMER_DURATION 20000 //the duration to start the timer for after a TARE in ms
+#define POST_TARE_DELAY 500 //amount of time to minus from the timer after a tare in ms
+#define SHOT_ADDR 0  //EPROM address to store shot counter (leave space between addresses in case of EPROM ware)
+#define SCALE_ADDR 16 //EPROM address to store scale factor
+#define CLEAN_ADDR 32 ////EPROM address to store clean counter
+#define REF_WEIGHT 447.8
+#define STD_SCALE_FACTOR 872
 #define SHOTS_UNTIL_CLEAN 50
 #define DESIRED_GRIND_MASS 18
 #define DESIRED_GRIND_MASS_SINGLE 10
 #define TARE_WEIGHT 600
-#define SLEEP_TIME 600 //time in seconds
-#define ACTIVE_TIMEOUT 2000 //time in miliseconds
-#define ACTIVE_RATE 0.5
+#define SLEEP_TIME 600 //time to sleep display  in seconds
+#define ACTIVE_TIMEOUT 2000 //time in miliseconds to timeout display to normal
+#define ACTIVE_RATE 0.5 // g/s to denote extraction in progress
 
 
 //Pin 1 = -
@@ -116,6 +117,11 @@ void setup() {
   scale.begin(PIN_HX711_DT, PIN_HX711_SCK);
   Serial.println("scale initialised");
   EEPROM.get(SCALE_ADDR, scaleFactor);
+  if (!(scaleFactor < 950) && !(scaleFactor > 700)) //sanity check the scale factor
+  {
+    scaleFactor = STD_SCALE_FACTOR;
+    EEPROM.put(SCALE_ADDR, STD_SCALE_FACTOR);
+  }
   scale.set_scale(scaleFactor);                 //scaleFactor = 872.f;
   scale.tare();
 
@@ -172,7 +178,13 @@ void loop() {
     }
     mean = (mean1 + mean2) / 2;
   }
-  
+
+  float difference = mean - previous;
+  //if the diffference is small then we average it with the previous. This prevents so much jitter. We do this after we've calcutaed the rate so we don't affect it.
+  if ((difference > -0.2) && (difference < 0.2))
+  {
+    mean = ((previous * 2) + mean) / 3;
+  }
   
   
 //calculate the flow rate once per second
@@ -180,7 +192,7 @@ void loop() {
   if (timeDiff > 500)
   {
      extractionRate = ((mean - lastRateReading) / timeDiff) * 1000; // g/second
-     if (extractionRate < 0.1)
+     if (extractionRate < 0.2)
      {
         extractionRate = 0;
      }
@@ -198,17 +210,12 @@ void loop() {
 
 
 
-  double difference = mean - previous;
-  //if the diffference is small then we average it with the previous. This prevents so much jitter. We do this after we've calcutaed the rate so we don't affect it.
-  if ((difference > -0.3) && (difference < 0.3))
-  {
-    mean = ((previous * 2) + mean) / 3;
-  }
+ 
 
   
 
   //start timer and continue until weight stops being added. If it's been less than TARE_TIMER_DURATION seconds since last tare then start the timer as well.
-  if ((mean >= 1) && (mean > (previous + 0.15)))
+  if ((mean >= 1) && (extractionRate > 0.4))
   {
     if (timerStarted == false)
     {
@@ -229,7 +236,7 @@ void loop() {
     else
     {
       //if it's been a second since the last weight was added then don't count that interval.
-      double timeSinceLast = (millis() - startTime);
+      long timeSinceLast = (millis() - startTime);
       if (timeSinceLast < 1000)
       {
         
@@ -614,7 +621,7 @@ void recal()
     double mean = scale.get_units(30);
     Serial.println("Resetting SF");
     //scale factor * reading / actual
-    scaleFactor = (scaleFactor * mean) / refWeight;
+    scaleFactor = (scaleFactor * mean) / REF_WEIGHT;
     if ((scaleFactor > 950) || (scaleFactor < 700))
     {
       Serial.println("Cal Error. New SF");
