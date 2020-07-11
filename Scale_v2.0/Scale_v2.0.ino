@@ -17,7 +17,7 @@
 #define SMALL_TEXT 1
 #define SCREEN_WIDTH 128 // OLED display width, in pixels
 #define SCREEN_HEIGHT 64 // OLED display height, in pixels
-#define TARE_TIMER_DURATION 20000 //the duration to start the timer for after a TARE in ms
+#define TARE_TIMER_DURATION 30000 //the duration to start the timer for after a TARE in ms
 #define POST_TARE_DELAY 500 //amount of time to minus from the timer after a tare in ms
 #define SHOT_ADDR 0  //EPROM address to store shot counter (leave space between addresses in case of EPROM ware)
 #define SCALE_ADDR 16 //EPROM address to store scale factor
@@ -29,8 +29,10 @@
 #define DESIRED_GRIND_MASS_SINGLE 10
 #define TARE_WEIGHT 600
 #define SLEEP_TIME 600 //time to sleep display  in seconds
-#define ACTIVE_TIMEOUT 2000 //time in miliseconds to timeout display to normal
-#define ACTIVE_RATE 0.5 // g/s to denote extraction in progress
+#define ACTIVE_TIMEOUT 10000 //time in miliseconds to timeout display to normal
+#define ACTIVE_RATE 0.2 // g/s to denote extraction in progress
+
+#define PERFECT_TEMP 95
 
 
 //Pin 1 = -
@@ -80,8 +82,10 @@ bool timerStarted = false, singleShot = false, doubleShot = false;
 int shotCounter, lastCleaned;
 bool cleanRequired = false;
 long lastTareTime = 0, lastRateTime = 0, lastActiveTime = 0;
-float lastRateReading = 0, extractionRate = 0;
+float lastRateReading = 0, extractionRate = 0, startMass = 0;
 float scaleFactor;
+float currentTemp = 0;
+
 bool blinkLEDON = false;
 
 
@@ -90,10 +94,14 @@ bool blinkLEDON = false;
 void setup() {
   pinMode(LED_BUILTIN, OUTPUT);
   pinMode(PIN_BEEP, OUTPUT);
+
+  pinMode(PIN_PUMP, INPUT);           // set pin to input
+  digitalWrite(PIN_PUMP, HIGH);  
   
   Serial.begin(38400);
   Serial.println((String)"Coffee Scale " + VERSION + " Feb 2020");
   sensors.begin();
+  sensors.setWaitForConversion(false);
   
    //setup display
   if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { // Address 0x3D for 128x64
@@ -116,20 +124,28 @@ void setup() {
   Serial.println("Initializing the scale");
   scale.begin(PIN_HX711_DT, PIN_HX711_SCK);
   Serial.println("scale initialised");
+
+  //scaleFactor = STD_SCALE_FACTOR;
+  //EEPROM.put(SCALE_ADDR, scaleFactor); //USE ON FIRST RUN TO SET EPROM
   EEPROM.get(SCALE_ADDR, scaleFactor);
+  Serial.println("Scale Factor:");
+  Serial.println(scaleFactor);
   if (!(scaleFactor < 950) && !(scaleFactor > 700)) //sanity check the scale factor
   {
+    Serial.println("Error in SF");
     scaleFactor = STD_SCALE_FACTOR;
     EEPROM.put(SCALE_ADDR, STD_SCALE_FACTOR);
   }
   scale.set_scale(scaleFactor);                 //scaleFactor = 872.f;
   scale.tare();
 
-
+  
 
 }
 
 void loop() {
+  int pumpVal = digitalRead(PIN_PUMP); 
+  Serial.println(pumpVal);
   
   if (blinkLEDON)
   {
@@ -150,6 +166,7 @@ void loop() {
 
   mean2 = previous;
   mean = mean1 = scale.get_units(1);
+  //Serial.println(mean);
   
   //compare new read to old, if they're miles off then something went wrong so go again
   while (((mean1 - mean2) > 3) || ((mean1 - mean2) < -2))
@@ -187,9 +204,9 @@ void loop() {
   }
   
   
-//calculate the flow rate once per second
+//calculate the flow rate and temp once per second
   long timeDiff = (millis() - lastRateTime) ;//time difference in mills between now and the last time around
-  if (timeDiff > 500)
+  if (timeDiff > 1000)
   {
      extractionRate = ((mean - lastRateReading) / timeDiff) * 1000; // g/second
      if (extractionRate < 0.2)
@@ -202,8 +219,23 @@ void loop() {
 
      if (extractionRate > ACTIVE_RATE)
      {
+        if (millis() > (lastActiveTime + 2000))
+        {
+          startMass = lastRateReading;
+        }
+
+        
         lastActiveTime = millis();
      }
+
+     
+     float newTemp = sensors.getTempCByIndex(0);
+     if ((currentTemp > PERFECT_TEMP) && (newTemp < PERFECT_TEMP))
+     {
+      beep(300,150);
+     }
+     currentTemp = newTemp;
+     sensors.requestTemperatures(); //this takes 750ms so put it last so as not to block.
   }
   
 
@@ -269,12 +301,15 @@ void loop() {
     if (singleShot == false)
     {
       singleShot = true;
-      shotCounter = shotCounter + 1;
-      beep();
-      EEPROM.put(SHOT_ADDR, shotCounter);
-      if (shotCounter > (lastCleaned +SHOTS_UNTIL_CLEAN))
+      if (extractionRate < 5)
       {
-        cleanRequired = true;
+        shotCounter = shotCounter + 1;
+        beep(150,75);
+        EEPROM.put(SHOT_ADDR, shotCounter);
+        if (shotCounter > (lastCleaned +SHOTS_UNTIL_CLEAN))
+        {
+          cleanRequired = true;
+        }
       }
     }
   }
@@ -284,12 +319,15 @@ void loop() {
     if (doubleShot == false)
     {
       doubleShot = true;
-      beep();
-      shotCounter = shotCounter + 1;
-      EEPROM.put(SHOT_ADDR, shotCounter);
-      if (shotCounter > (lastCleaned +SHOTS_UNTIL_CLEAN))
+      if (extractionRate < 5)
       {
-        cleanRequired = true;
+        beep(300, 100);
+        shotCounter = shotCounter + 1;
+        EEPROM.put(SHOT_ADDR, shotCounter);
+        if (shotCounter > (lastCleaned +SHOTS_UNTIL_CLEAN))
+        {
+          cleanRequired = true;
+        }
       }
     }
     digitalWrite(LED_BUILTIN, HIGH);
@@ -303,27 +341,34 @@ void loop() {
     mean = 0;
   }
 
+
   long runningTime = ((long)millis() - lastTareTime) / 1000;
   if (runningTime < SLEEP_TIME)
   {
-    if (millis() < (lastActiveTime + ACTIVE_TIMEOUT)) //if it's been longer than Active timeout since our last reading then normal display. Otherwise display shot
+    if ((millis() < (lastActiveTime + ACTIVE_TIMEOUT)) && (extractionRate < 5)) //if it's been longer than Active timeout since our last reading then normal display. Otherwise display shot. Above rate 5 is usually a cooling shot.
     {
-      displayShot(mean, timer, extractionRate);
+      displayShot(mean, timer, extractionRate, currentTemp);
     }
     else
     {
-      displayStuff(mean, shotCounter, timer);
-      
+      displayStuff(mean, shotCounter, timer, currentTemp, false);
     }
-
   }
   else
   {
     display.clearDisplay();
     display.display();
-    scale.power_down();             // put the ADC in sleep mode
-    delay(1000);
-    scale.power_up();
+    
+    
+    while (mean1 < TARE_WEIGHT)
+    {
+      scale.power_down();             // put the ADC in sleep mode
+      delay(500);
+      scale.power_up();
+      mean1 = scale.get_units(1);
+
+    }
+    tareMenu(mean1);
     
   }
 
@@ -331,15 +376,23 @@ void loop() {
 
 }
 
-void beep()
+
+void beep(int freq, int duration)
 {
-  tone(PIN_BEEP, 150);
-  delay(75);
+  tone(PIN_BEEP, freq);
+  delay(duration);
   noTone(PIN_BEEP);
 }
 
-void displayShot(double extraction, float timer, float rate)
+void displayShot(float extraction, float timer, float rate, float temp)
 {
+
+  char startMassStr[7];
+  float autoTareMass = extraction - startMass;
+  dtostrf(autoTareMass, 5, 1, startMassStr);
+  startMassStr[5] = 'g';
+  startMassStr[6] = '\0';
+  
   char meanStr[7];
   dtostrf(extraction, 5, 1, meanStr);
   meanStr[5] = 'g';
@@ -350,12 +403,13 @@ void displayShot(double extraction, float timer, float rate)
   timeStr[5] = 's';
   timeStr[6] = '\0';
 
-  char rateStr[9];
+  char rateStr[6];
   dtostrf(rate, 5, 1, rateStr);
-  rateStr[5] = 'g';
-  rateStr[6] = '/';
-  rateStr[7] = 's';
-  rateStr[8] = '\0';
+  rateStr[5] = '\0';
+
+  char tempStr[5];
+  dtostrf(temp, 4, 1, tempStr);
+  tempStr[4] = '\0';
 
   display.clearDisplay();
   display.setTextColor(WHITE);
@@ -368,11 +422,17 @@ void displayShot(double extraction, float timer, float rate)
   display.setCursor(30, 28);
   display.print("Timer: ");
 
-  display.setCursor(30, 55);
-  display.print("Rate: ");
+  display.setCursor(0, 55);
+  display.print("AE: ");
 
-  display.setCursor(55, 55);
-  display.print(rateStr);
+  display.setCursor(15, 55);
+  display.print(startMassStr);
+
+  display.setCursor(60, 55);
+  display.print("Temp: ");
+
+  display.setCursor(95, 55);
+  display.print(tempStr);
   
   display.setTextSize(LARGE_TEXT);
   
@@ -387,19 +447,19 @@ void displayShot(double extraction, float timer, float rate)
 }
 
 
-void displayStuff(double extraction, int shots, float timer)
+void displayStuff(float extraction, int shots, float timer)
 {
   displayStuff(extraction, shots, timer, false);
 }
 
-void displayStuff(double extraction, int shots, float timer, bool newGrind)
+void displayStuff(float extraction, int shots, float timer, bool newGrind)
 {
-  sensors.requestTemperatures(); 
-  float temp = sensors.getTempCByIndex(0);
-  displayStuff(extraction, shots, timer, temp, newGrind);
+  //sensors.requestTemperatures(); 
+  //float temp = sensors.getTempCByIndex(0);
+  displayStuff(extraction, shots, timer, currentTemp, newGrind);
 }
 
-void displayStuff(double extraction, int shots, float timer, float temp, bool newGrind)
+void displayStuff(float extraction, int shots, float timer, float temp, bool newGrind)
 {
   char shotsStr[5];
   itoa(shots, shotsStr, 10);
@@ -510,7 +570,7 @@ void displayStuff(char text[])
 
 
 
-void tareMenu(double mean)
+void tareMenu(float mean)
 {
 
   timer = 0;
@@ -579,7 +639,7 @@ void tareScale()
 {
   displayStuff("Menu", "", "TARE", "");
   scale.tare();
-  double mean = scale.get_units(2);
+  float mean = scale.get_units(2);
   int i = 0;
   while (((mean > 1) || (mean < -1)) && (i < 10))
   {
@@ -618,7 +678,7 @@ void recal()
     displayStuff("Place Tamp 447.8 ");
     
     delay(3000);
-    double mean = scale.get_units(30);
+    float mean = scale.get_units(30);
     Serial.println("Resetting SF");
     //scale factor * reading / actual
     scaleFactor = (scaleFactor * mean) / REF_WEIGHT;
@@ -655,7 +715,7 @@ void newGrind()
   displayStuff("New Grind", "", "Set 15S", "");
   delay(4000);
 
-  double mean = scale.get_units(2);
+  float mean = scale.get_units(2);
   while (mean < 300)
   {
     mean = scale.get_units(10);
@@ -666,14 +726,14 @@ void newGrind()
       grindTime = float(DESIRED_GRIND_MASS) / (mean / 15);
       grindTime = grindTime * 1000;
       grindTimeSingle = float(DESIRED_GRIND_MASS_SINGLE) / (mean / 15);
-      grindTimeSingle = grindTime * 1000;
+      
     }
     if (((mean < 1) && (mean > 0.2)) || ((mean > -1) && (mean < -0.2)))
     {
       displayStuff(mean, 2, grindTime, grindTimeSingle, true);
       scale.tare();
     }
-    displayStuff(mean, 2, grindTime, true);
+    displayStuff(mean, 2, grindTime, grindTimeSingle, true);
   }
   displayStuff("New Grind", "", "Done", "");
   tareScale();
