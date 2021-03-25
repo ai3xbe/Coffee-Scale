@@ -2,6 +2,7 @@
 // Scale factor:
 // 1Kg cell: 872 for reading in gms
 //scale factor * reading / actual
+//23600 RAW reading of plate only
 
 
 #include "HX711.h"
@@ -19,7 +20,7 @@
 #define SCREEN_HEIGHT 64 // OLED display height, in pixels
 #define TARE_TIMER_DURATION 30000 //the duration to start the timer for after a TARE in ms
 #define POST_TARE_DELAY 500 //amount of time to minus from the timer after a tare in ms
-#define SHOT_ADDR 0  //EPROM address to store shot counter (leave space between addresses in case of EPROM ware)
+#define SHOT_ADDR 0  //EPROM address to store shot counter (leave space between addresses in case of EPROM wear)
 #define SCALE_ADDR 16 //EPROM address to store scale factor
 #define CLEAN_ADDR 32 ////EPROM address to store clean counter
 #define REF_WEIGHT 447.8
@@ -29,8 +30,10 @@
 #define DESIRED_GRIND_MASS_SINGLE 10
 #define TARE_WEIGHT 600
 #define SLEEP_TIME 600 //time to sleep display  in seconds
-#define ACTIVE_TIMEOUT 10000 //time in miliseconds to timeout display to normal
+#define ACTIVE_TIMEOUT 5 //time in seconds to timeout display to normal
+#define COOLING_TIMEOUT 40 //time in seconds qto keep the cooling shot timer going for 
 #define ACTIVE_RATE 0.2 // g/s to denote extraction in progress
+#define NO_COFFEE_RATE 5 // g/s to denote pure water in progress
 
 #define PERFECT_TEMP 95
 
@@ -73,18 +76,19 @@ HX711 scale; //the scale
 OneWire oneWire(PIN_TEMP); //temp sensor
 DallasTemperature sensors(&oneWire);
 
-
+bool dbg = false;
 
 //globals
-long startTime = 0;
+long startTime = 0, endOfcoolingFlush = 0;
 float timer = 0, previous = 0;
-bool timerStarted = false, singleShot = false, doubleShot = false;
+bool timerStarted = false, singleShot = false, doubleShot = false, activeShot = false, coolingFlush = false;
 int shotCounter, lastCleaned;
 bool cleanRequired = false;
 long lastTareTime = 0, lastRateTime = 0, lastActiveTime = 0;
-float lastRateReading = 0, extractionRate = 0, startMass = 0;
+float lastRateReading = 0, extractionRate = 0, maxExtractionRate = 0, startMass = 0, massAt30 = 0;
 float scaleFactor;
 float currentTemp = 0;
+
 
 bool blinkLEDON = false;
 
@@ -108,6 +112,7 @@ void setup() {
     Serial.println(F("SSD1306 alloc failed"));
     for (;;);
   }
+  display.setRotation(2); //we have the display upside down!
   
 
   displayStuff("Hello", "AB", "Init", VERSION);
@@ -121,8 +126,9 @@ void setup() {
   
 
   //setup scale
-  Serial.println("Initializing the scale");
+  Serial.println("Initializing the scale.. RAW READING");
   scale.begin(PIN_HX711_DT, PIN_HX711_SCK);
+  Serial.println(scale.read_average(20));
   Serial.println("scale initialised");
 
   //scaleFactor = STD_SCALE_FACTOR;
@@ -138,32 +144,276 @@ void setup() {
   }
   scale.set_scale(scaleFactor);                 //scaleFactor = 872.f;
   scale.tare();
+  Serial.println("Scale Offset:");
+  Serial.println(scale.get_offset());
 
+
+  //recal on startup if pump is set on.
+  bool activeShot = !digitalRead(PIN_PUMP); 
+  if (activeShot)
+  {
+    recal();
+  }
   
 
 }
 
+
+
+
+
+
+
+
+
+
+
 void loop() {
-  int pumpVal = digitalRead(PIN_PUMP); 
-  Serial.println(pumpVal);
+  int n;
+  float mean;
+  bool coolingFlushActive = false;
   
-  if (blinkLEDON)
+  blinkLED();
+
+  bool activeShotNew = !digitalRead(PIN_PUMP); 
+
+  //if this is a new shot then reset all the timers etc
+  if (activeShotNew && (activeShot != activeShotNew))
   {
-    digitalWrite(LED_BUILTIN, LOW);
-    blinkLEDON = false;
+    doubleShot = false;
+    singleShot = false;
+    maxExtractionRate = 0;
+    massAt30 = 0;
+    coolingFlush = false;
+    timer = 0;
+  }
+  
+  activeShot = activeShotNew;
+  if (activeShot)
+  {
+    lastActiveTime = millis();
+  }
+
+  long timeSinceLastActive = ((long)millis() - lastActiveTime) / 1000;
+  if (timeSinceLastActive > ACTIVE_TIMEOUT) //if it's been a while since we were last active then reset the shot counters.
+  {
+    doubleShot = false;
+    singleShot = false;
+    maxExtractionRate = 0;
+    massAt30 = 0;
+  }
+
+  if (timeSinceLastActive > COOLING_TIMEOUT)
+  {
+    coolingFlush = false;
+    timer = 0;
+  }
+
+  
+  dbgPnt(1);
+
+
+  //read the scale!!!!
+  mean = readScaleDebounce();
+
+
+  
+  dbgPnt(3);
+
+
+
+
+  
+  
+  long timeDiff = (millis() - lastRateTime) ;//time difference in mills between now and the last time around
+  
+  //calculate the flow rate and temp once per second
+  if (timeDiff > 1000)
+  {
+     extractionRate = ((mean - lastRateReading) / timeDiff) * 1000; // g/second
+     if (extractionRate < 0.2)
+     {
+        extractionRate = 0;
+     }
+     lastRateReading = mean;
+     lastRateTime = millis();
+
+     if (extractionRate > maxExtractionRate)
+     {
+        maxExtractionRate = extractionRate;
+     }
+
+
+     if (extractionRate > ACTIVE_RATE)
+     {
+        if (millis() > (lastActiveTime + 2000))
+        {
+          startMass = lastRateReading;
+        }    
+     }
+
+     
+
+     float newTemp = sensors.getTempCByIndex(0);
+     if ((currentTemp >= PERFECT_TEMP) && (newTemp <= PERFECT_TEMP))
+     {
+      beep(300,150);
+     }
+     currentTemp = newTemp;
+     sensors.requestTemperatures(); //this takes 750ms so put it last so as not to block.
+  }
+  
+
+  dbgPnt(4);
+
+
+ 
+
+  
+
+  if (activeShot)
+  {
+    if (timerStarted == false)
+    {
+      
+      startTime = millis();
+      scale.tare();
+
+      timer = millis() - startTime;
+      timerStarted = true;
+      Serial.print("Start Timer "); Serial.print(startTime);
+    }
+    else
+    {
+      //if it's been a second since the last weight was added then don't count that interval.
+      long timeSinceLast = (millis() - startTime);
+      if (timeSinceLast < 1000)
+      {
+        
+        timer = timer + timeSinceLast;
+      }
+      startTime = millis();
+
+      if ((timer > 30000) && (massAt30 ==0))
+      {
+        massAt30 = mean;
+      }
+      
+    }
+
+    if (extractionRate > NO_COFFEE_RATE)
+     {
+      coolingFlush = true; //this stick
+      coolingFlushActive = true; //this gets reset each cycle
+      endOfcoolingFlush = millis();
+     }
+    
   }
   else
   {
-    digitalWrite(LED_BUILTIN, HIGH);  
-    blinkLEDON = true;
+    timerStarted = false;
   }
+
   
-  int n;
+  
+
+
+dbgPnt(5);
+
+  //Count the shots
+  if ((extractionRate > ACTIVE_RATE) && (coolingFlushActive == false) && activeShot)
+  {
+    if ((mean > 15) && (mean < 16))
+    {
+      //if we haven't already counted a single shot then do so.
+      if (singleShot == false)
+      {
+        singleShot = true;
+        shotCounter = shotCounter + 1;
+        beep(150,75);
+        EEPROM.put(SHOT_ADDR, shotCounter);
+        if (shotCounter > (lastCleaned +SHOTS_UNTIL_CLEAN))
+        {
+          cleanRequired = true;
+        }
+        
+      }
+    }
+    else if ((mean > 25) && (mean < 30))
+    {
+      //if we haven't already counted a double shot then do so.
+      if (doubleShot == false)
+      {
+        doubleShot = true;
+        beep(300, 75);
+        delay(50);
+        beep(300, 75);
+        
+        shotCounter = shotCounter + 1;
+        EEPROM.put(SHOT_ADDR, shotCounter);
+        if (shotCounter > (lastCleaned +SHOTS_UNTIL_CLEAN))
+        {
+          cleanRequired = true;
+        }
+        
+      }
+    }
+  }
+
+
+
+
+  
+  
+  if ((timeSinceLastActive < SLEEP_TIME))
+  {
+    if ((timeSinceLastActive < ACTIVE_TIMEOUT) && (coolingFlush == false))
+    {
+      if (activeShot)
+      {
+        //if the pump is on display the extraction
+        displayShot(mean, timer, extractionRate, currentTemp);  
+      }
+      else
+      {
+        displayShot(mean, timer, maxExtractionRate, currentTemp);  //if the pump is off show the max extraction rate and mass at 30s
+      }
+    }
+    else
+    {
+      if (coolingFlush)
+      {
+        timer = millis() - endOfcoolingFlush;
+        displayStuff(mean, shotCounter, timer, currentTemp, false);
+      }
+      else
+      {
+        displayStuff(mean, shotCounter, timer, currentTemp, false);
+      }
+    }
+  }
+  else
+  {
+    //sleep. Power down the scale, turn off the display and wait for the pump signal.
+    display.clearDisplay();
+    display.display();
+    scale.power_down();     
+    while (digitalRead(PIN_PUMP)) //while the pump isn't on..
+    {
+      delay(200);
+    }
+    scale.power_up();
+    
+  }
+
+
+
+}
+
+float readScaleDebounce()
+{
   float mean;
   float mean1, mean2;
-  bool activeShot = false;
-
-
   mean2 = previous;
   mean = mean1 = scale.get_units(1);
   //Serial.println(mean);
@@ -179,8 +429,7 @@ void loop() {
       mean1 = -999;
     }
     if (scale.wait_ready_timeout(500)) {
-      mean2 = scale.get_units(1);
-      
+      mean2 = scale.get_units(1);   
     }
     else
     {
@@ -196,184 +445,20 @@ void loop() {
     mean = (mean1 + mean2) / 2;
   }
 
+  dbgPnt(2);
+  
   float difference = mean - previous;
   //if the diffference is small then we average it with the previous. This prevents so much jitter. We do this after we've calcutaed the rate so we don't affect it.
   if ((difference > -0.2) && (difference < 0.2))
   {
     mean = ((previous * 2) + mean) / 3;
   }
-  
-  
-//calculate the flow rate and temp once per second
-  long timeDiff = (millis() - lastRateTime) ;//time difference in mills between now and the last time around
-  if (timeDiff > 1000)
-  {
-     extractionRate = ((mean - lastRateReading) / timeDiff) * 1000; // g/second
-     if (extractionRate < 0.2)
-     {
-        extractionRate = 0;
-     }
-     lastRateReading = mean;
-     lastRateTime = millis();
-
-
-     if (extractionRate > ACTIVE_RATE)
-     {
-        if (millis() > (lastActiveTime + 2000))
-        {
-          startMass = lastRateReading;
-        }
-
-        
-        lastActiveTime = millis();
-     }
-
-     
-     float newTemp = sensors.getTempCByIndex(0);
-     if ((currentTemp > PERFECT_TEMP) && (newTemp < PERFECT_TEMP))
-     {
-      beep(300,150);
-     }
-     currentTemp = newTemp;
-     sensors.requestTemperatures(); //this takes 750ms so put it last so as not to block.
-  }
-  
-
-
-
-
- 
-
-  
-
-  //start timer and continue until weight stops being added. If it's been less than TARE_TIMER_DURATION seconds since last tare then start the timer as well.
-  if ((mean >= 1) && (extractionRate > 0.4))
-  {
-    if (timerStarted == false)
-    {
-      
-      //if we tared less than X seconds ago, count that as the start
-      if ((millis() - lastTareTime ) < TARE_TIMER_DURATION)
-      {
-        startTime = lastTareTime;
-      }
-      else
-      {
-        startTime = millis();
-      }
-      timer = millis() - startTime;
-      timerStarted = true;
-      Serial.print("Start Timer "); Serial.print(startTime);
-    }
-    else
-    {
-      //if it's been a second since the last weight was added then don't count that interval.
-      long timeSinceLast = (millis() - startTime);
-      if (timeSinceLast < 1000)
-      {
-        
-        timer = timer + timeSinceLast;
-      }
-      startTime = millis();
-    }
-  }
-  else if ((mean < 1) && (mean > -50))
-  {
-    if (((long)millis() - lastTareTime ) < TARE_TIMER_DURATION)
-    {
-      timer = (long)millis() - lastTareTime;
-      
-    }
-    else
-    {
-      timer = 0;
-    }
-
-  }
-
-
-
-
-  //Count the shots
-  if ((mean > 11) && (mean < 15))
-  {
-    //if we haven't already counted a single shot then do so.
-    if (singleShot == false)
-    {
-      singleShot = true;
-      if (extractionRate < 5)
-      {
-        shotCounter = shotCounter + 1;
-        beep(150,75);
-        EEPROM.put(SHOT_ADDR, shotCounter);
-        if (shotCounter > (lastCleaned +SHOTS_UNTIL_CLEAN))
-        {
-          cleanRequired = true;
-        }
-      }
-    }
-  }
-  else if ((mean > 25) && (mean < 32))
-  {
-    //if we haven't already counted a double shot then do so.
-    if (doubleShot == false)
-    {
-      doubleShot = true;
-      if (extractionRate < 5)
-      {
-        beep(300, 100);
-        shotCounter = shotCounter + 1;
-        EEPROM.put(SHOT_ADDR, shotCounter);
-        if (shotCounter > (lastCleaned +SHOTS_UNTIL_CLEAN))
-        {
-          cleanRequired = true;
-        }
-      }
-    }
-    digitalWrite(LED_BUILTIN, HIGH);
-  }
-
-
-
   previous = mean;
   if ((mean < 1) && (mean > -1))
   {
     mean = 0;
   }
-
-
-  long runningTime = ((long)millis() - lastTareTime) / 1000;
-  if (runningTime < SLEEP_TIME)
-  {
-    if ((millis() < (lastActiveTime + ACTIVE_TIMEOUT)) && (extractionRate < 5)) //if it's been longer than Active timeout since our last reading then normal display. Otherwise display shot. Above rate 5 is usually a cooling shot.
-    {
-      displayShot(mean, timer, extractionRate, currentTemp);
-    }
-    else
-    {
-      displayStuff(mean, shotCounter, timer, currentTemp, false);
-    }
-  }
-  else
-  {
-    display.clearDisplay();
-    display.display();
-    
-    
-    while (mean1 < TARE_WEIGHT)
-    {
-      scale.power_down();             // put the ADC in sleep mode
-      delay(500);
-      scale.power_up();
-      mean1 = scale.get_units(1);
-
-    }
-    tareMenu(mean1);
-    
-  }
-
-
-
+  return mean;
 }
 
 
@@ -384,15 +469,63 @@ void beep(int freq, int duration)
   noTone(PIN_BEEP);
 }
 
+void blinkLED()
+{
+   if (blinkLEDON)
+  {
+    digitalWrite(LED_BUILTIN, LOW);
+    blinkLEDON = false;
+  }
+  else
+  {
+    digitalWrite(LED_BUILTIN, HIGH);  
+    blinkLEDON = true;
+  }
+}
+
+void dbgPnt(int spot)
+{
+
+  if (dbg && !activeShot)
+  {
+    display.setTextSize(SMALL_TEXT);
+    display.setCursor(85, 55);
+  
+    if (spot == 1)
+    {
+      display.print(".");
+    }
+    else if (spot == 2)
+    {
+      display.print("..");
+    }
+    else if (spot == 3)
+    {
+      display.print("...");   
+    }
+    else if (spot == 4)
+    {
+      display.print("....");
+
+    }
+    else if (spot == 5)
+    {
+      display.print(".....");
+
+    }
+    else if (spot == 6)
+    {
+      display.print("......");
+
+    }
+    display.display();
+  }
+}
+
 void displayShot(float extraction, float timer, float rate, float temp)
 {
 
-  char startMassStr[7];
-  float autoTareMass = extraction - startMass;
-  dtostrf(autoTareMass, 5, 1, startMassStr);
-  startMassStr[5] = 'g';
-  startMassStr[6] = '\0';
-  
+ 
   char meanStr[7];
   dtostrf(extraction, 5, 1, meanStr);
   meanStr[5] = 'g';
@@ -423,10 +556,10 @@ void displayShot(float extraction, float timer, float rate, float temp)
   display.print("Timer: ");
 
   display.setCursor(0, 55);
-  display.print("AE: ");
+  display.print("AR: ");
 
   display.setCursor(15, 55);
-  display.print(startMassStr);
+  display.print(rateStr);
 
   display.setCursor(60, 55);
   display.print("Temp: ");
@@ -478,10 +611,10 @@ void displayStuff(float extraction, int shots, float timer, float temp, bool new
   meanStr[5] = 'g';
   meanStr[6] = '\0';
   
-  char timeStr[7];
-  dtostrf((float(timer) / 1000), 5, 1, timeStr);
-  timeStr[5] = 's';
-  timeStr[6] = '\0';
+  char timeStr[6];
+  dtostrf((float(timer) / 1000), 4, 0, timeStr);
+  timeStr[4] = 's';
+  timeStr[5] = '\0';
   
   char tempStr[5];
   dtostrf(temp, 4, 1, tempStr);
@@ -506,13 +639,13 @@ void displayStuff(char extraction[], char shots[], char timer[], char temp[], bo
   display.print("Extraction: ");
   
   display.setCursor(0, 35);
-  display.print("Timer:");
+  display.print("Temp:");
   
   display.setCursor(85, 0);
   display.print("Shots:");
   
   display.setCursor(85, 20);
-  display.print("Temp:");
+  display.print("Timer:");
   
   display.setCursor(85, 40);
   display.print("Status:");
@@ -525,7 +658,7 @@ void displayStuff(char extraction[], char shots[], char timer[], char temp[], bo
   display.print(extraction);
   
   display.setCursor(0, 45);
-  display.print(timer);
+  display.print(temp);
 
 
   display.setTextSize(SMALL_TEXT);
@@ -534,7 +667,7 @@ void displayStuff(char extraction[], char shots[], char timer[], char temp[], bo
   display.print(shots);
   
   display.setCursor(95, 30);
-  display.print(temp);
+  display.print(timer);
   
   
   display.setCursor(95, 50);
@@ -578,7 +711,7 @@ void tareMenu(float mean)
   singleShot = false;
   doubleShot = false;
 
-  displayStuff("Menu", "", "TARE", "");
+  displayStuff("Menu", "", "", "TARE");
 
   delay(1500);
 
@@ -598,7 +731,7 @@ void tareMenu(float mean)
   }
 
   //check for clean
-  displayStuff("Menu", "", "Clean?", "");
+  displayStuff("Menu", "", "", "Clean?");
   delay(2000);
   mean = scale.get_units(2);
   if (mean > 700)
@@ -606,12 +739,12 @@ void tareMenu(float mean)
     cleanRequired = false;
     lastCleaned = shotCounter;
     EEPROM.put(CLEAN_ADDR, lastCleaned);
-    displayStuff("Menu", "Done", "Clean", "");
+    displayStuff("Menu", "", "Clean", "Done");
     return;
   }
 
   //check for recal
-  displayStuff("Menu", "", "Recal?", "");
+  displayStuff("Menu", "", "", "Recal?");
   delay(2000);
   mean = scale.get_units(2);
   if (mean > 700)
@@ -620,8 +753,18 @@ void tareMenu(float mean)
     return;
   }
 
+  //check for recal
+  displayStuff("Menu", "", "", "Debug?");
+  delay(2000);
+  mean = scale.get_units(2);
+  if (mean > 700)
+  {
+    dbg = !dbg;
+    return;
+  }
+
   //check for shot reset
-  displayStuff("Menu", "", "Reset SC?", "");
+  displayStuff("Menu", "", "", "Reset SC?");
   delay(2000);
 
   mean = scale.get_units(2);
@@ -637,7 +780,7 @@ void tareMenu(float mean)
 
 void tareScale()
 {
-  displayStuff("Menu", "", "TARE", "");
+  displayStuff("Menu", "", "", "TARE");
   scale.tare();
   float mean = scale.get_units(2);
   int i = 0;
@@ -647,7 +790,7 @@ void tareScale()
     dtostrf(mean, 5, 1, meanStr);
     meanStr[5] = 'g';
     meanStr[6] = '\0';
-    displayStuff(meanStr, "10", "Re Tare", "");
+    displayStuff(meanStr, "10", "", "Re Tare");
     delay(1000);
     scale.tare();
     mean = scale.get_units(2);
@@ -655,7 +798,7 @@ void tareScale()
   }
   if (i == 10)
   {
-    displayStuff("ERROR", "", "FAIL", "");
+    displayStuff("ERROR", "", "", "FAIL");
     delay(10000);
   }
   lastTareTime = millis() + POST_TARE_DELAY;
@@ -671,7 +814,7 @@ void recal()
   while (calibrationSuccess == false)
   {
     //recalibrate the scale based on weight of tamp
-    displayStuff("Recal", "", "TARE", "");
+    displayStuff("Recal", "", "", "TARE");
     delay(3000);
     
     scale.tare();;
@@ -697,7 +840,7 @@ void recal()
       EEPROM.put(SCALE_ADDR, scaleFactor);
       char sfStr[5];
       dtostrf(scaleFactor, 5, 1, sfStr);
-      displayStuff("Recal", sfStr, "Done", "");
+      displayStuff("Recal", sfStr, "", "Done");
       delay(3000);
       calibrationSuccess = true;
     }
@@ -706,17 +849,21 @@ void recal()
 
 }
 
+
+
 void newGrind()
 {
 
-  displayStuff("New Grind", "", "TARE", "");
-  delay(1000);
+  displayStuff("New Grind", "", "", "TARE");
+  delay(500);
   tareScale();
-  displayStuff("New Grind", "", "Set 15S", "");
+  displayStuff("New Grind", "", "", "Set 15S");
   delay(4000);
 
   float mean = scale.get_units(2);
-  while (mean < 300)
+  //activeShot = !digitalRead(PIN_PUMP);
+  //while the pump isn't on...
+  while ((mean < 400 ) && (digitalRead(PIN_PUMP)))
   {
     mean = scale.get_units(10);
     float grindTime = 0;
@@ -724,18 +871,17 @@ void newGrind()
     if (mean > 2)
     {
       grindTime = float(DESIRED_GRIND_MASS) / (mean / 15);
-      grindTime = grindTime * 1000;
+      grindTime = grindTime;
       grindTimeSingle = float(DESIRED_GRIND_MASS_SINGLE) / (mean / 15);
       
     }
     if (((mean < 1) && (mean > 0.2)) || ((mean > -1) && (mean < -0.2)))
     {
-      displayStuff(mean, 2, grindTime, grindTimeSingle, true);
+      displayStuff(mean, 2, grindTimeSingle, grindTime, true);
       scale.tare();
     }
-    displayStuff(mean, 2, grindTime, grindTimeSingle, true);
+    displayStuff(mean, 2, grindTimeSingle, grindTime, true);
   }
-  displayStuff("New Grind", "", "Done", "");
-  tareScale();
+
 
 }
